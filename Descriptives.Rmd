@@ -1,0 +1,1285 @@
+---
+title: "Descriptives"
+author: "Dominik Bär"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# ##################################################################################################################
+#    File analyses parleys (posts/comments)
+# ##################################################################################################################
+
+# Libraries
+
+```{r library, include=FALSE}
+
+library(tidyverse)
+library(lubridate)
+library(doParallel)
+library(furrr)
+library(caret)
+library(broom)
+library(tidytext)
+library(stopwords)
+library(wordcloud)
+library(Rtsne)
+
+## Functions
+source("utils.R")
+
+```
+
+# Directories
+
+```{r paths, include = FALSE}
+
+# Input data
+path_input <- "./../data/input/parleys_user"
+# Output data
+path_output <- "../../data/output/"
+# Path figures
+path_figures <- "../../Doc/QAnonIdentification/figures/"
+
+```
+
+# Load data
+
+```{r load data, include=FALSE}
+
+# User data
+load(str_c(path_output, "data_qanon_user.Rdata"))
+
+# QAnon users
+load(str_c(path_output, "user_qanon.Rdata"))
+
+# User features
+load(str_c(path_output, "features_user.Rdata")) 
+# Linguistic featues
+load(str_c(path_output, "features_linguistic.Rdata"))
+#features_empath <- read_csv(str_c(path_output, "features_empath.csv"))
+#features_liwc <- read_csv(str_c(path_output, "features_liwc.csv"))
+features_perspective <- read_csv(str_c(path_output, "features_perspective.csv"))
+#features_stance <- read_csv(str_c(path_output, "features_stance.csv"))
+
+# Network features
+features_network <- read_csv(str_c(path_output, "features_network.csv"))
+
+# Transform qIndicator to factor
+features_all_unalterd <- features_user %>%
+  left_join(features_linguistic, by = "creator") %>%
+#  left_join(features_empath, by = "creator") %>%
+#  left_join(features_liwc, by = "creator") %>%
+  left_join(features_perspective, by = "creator") %>%
+#  left_join(features_stance, by = "creator") %>%
+  left_join(features_network, by = "creator") %>%
+  dplyr::select(-qIndicator.y) %>%
+  rename("qIndicator" = "qIndicator.x") %>%
+  distinct(creator, .keep_all = TRUE) %>%
+  mutate(qIndicator = factor(qIndicator, levels = c(0, 1), labels = c("non.QAnon", "QAnon")))
+
+# Remove "q" from stopwords
+stop <- stop_words[stop_words$word != "q", ]
+
+```
+
+# Important variables
+
+```{r}
+
+# Set seed
+set.seed(1234)
+
+```
+
+# Feature names
+
+```{r}
+
+# Vector with feature names
+names_features_user <- c("account_age", "user_followers", "user_following" , "user_posts", "user_comments", "freq_upvotes_posts", "freq_impressions", "freq_upvotes_comments", "freq_downvotes_comments")
+names_features_stylistic <- c("freq_handle_user", "freq_hash_user", "freq_pos_user", "freq_long_words_user", "freq_urls", "user_sentiment", "TOXICITY", "SEVERE_TOXICITY", "PROFANITY", "THREAT")
+names_features_network <- c("betweenness", "eigen_left", "eigen_right", "degree_in", "degree_out")
+names_features_text <- str_c("text", c(0:383))
+names_features_all <- c(names_features_user, names_features_stylistic, names_features_text)
+
+```
+
+# Parallel Processing
+
+```{r}
+
+cores <- detectCores()
+plan(multisession, workers = cores-1)
+
+```
+
+# Descriptive statistics
+
+## User data
+
+### Total number of observations (users)
+
+```{r, echo = FALSE}
+
+# Number of users
+# Overall
+nrow(features_all_unalterd)
+
+# by QAnon
+features_all_unalterd %>%
+  group_by(qIndicator) %>%
+  summarize(n())
+
+# Number of posts
+# Overall
+descriptives_data <- features_all_unalterd %>%
+  summarize(n_followers = sum(user_followers, na.rm = TRUE),
+            n_following = sum(user_following, na.rm = TRUE),
+            n_posts = sum(user_posts, na.rm = TRUE),
+            n_comments = sum(user_comments, na.rm = TRUE),
+            n_upvotes_posts = sum(n_upvotes_posts, na.rm = TRUE),
+            n_impressions = sum(n_impressions, na.rm = TRUE),
+            n_upvotes_comments = sum(n_upvotes_comments, na.rm = TRUE),
+            n_downvotes_comments = sum(n_downvotes_comments, na.rm = TRUE),
+            n_users = n()) %>%
+  mutate(across(.cols = everything(), ~ .x/n_users, .names = "rel_{.col}"))
+
+descriptives_export <- descriptives_data %>%
+  select(starts_with("n_")) %>%
+  t() %>%
+  as.data.frame() %>%
+  cbind(descriptives_data %>% select(starts_with("rel_")) %>% t() %>% as.data.frame())
+
+# by QAnon
+features_all_unalterd %>%
+  group_by(qIndicator) %>%
+  summarize(n_posts = sum(user_posts, na.rm = TRUE),
+            n_comments = sum(user_comments, na.rm = TRUE))
+
+
+```
+
+```{r}
+
+# Posts with hashtags
+nrow(parleys %>% filter(str_detect(body, pattern = "#"))) / nrow(parleys)
+
+```
+
+```{r}
+
+# Example Bios
+bios_example <- data_qanon_user %>%
+  group_by(qIndicator) %>%
+  select(qIndicator, bio) %>%
+  filter(!str_detect(bio, pattern = "[^\x01-\x7F]")) %>%
+  slice_sample(n = 5)
+  
+```
+
+
+### Followers, Following, Posts, Comments, Likes
+
+#### Overvall
+
+```{r, include=FALSE}
+
+# Descriptive statistics for user features
+descriptives_user <- features_all_unalterd %>%
+  select(all_of(names_features_user)) %>%
+  summarize(across(.fns = list(Min = min, Mean = mean, Median = median, Max = max, Sd = sd), na.rm = TRUE, .names = "{.fn}b{.col}")) %>%
+  data.frame(.) %>%
+  mutate_if(is.numeric, round, digits = 2) %>% 
+  pivot_longer(cols = everything(),
+               names_to = c("set", ".value"),
+               names_pattern = "(.+)b(.*)")
+
+# Descriptive statistics for stylistic features
+descriptives_stylistic <- features_all_unalterd %>%
+  select(all_of(names_features_stylistic)) %>%
+  summarize(across(.fns = list(Min = min, Mean = mean, Median = median, Max = max, Sd = sd), na.rm = TRUE, .names = "{.fn}b{.col}")) %>%
+  data.frame(.) %>%
+  mutate_if(is.numeric, round, digits = 2) %>% 
+  pivot_longer(cols = everything(),
+               names_to = c("set", ".value"),
+               names_pattern = "(.+)b(.*)")
+
+# Descriptive statistics for network features
+descriptives_stylistic <- features_all_unalterd %>%
+  select(all_of(names_features_stylistic)) %>%
+  summarize(across(.fns = list(Min = min, Mean = mean, Median = median, Max = max, Sd = sd), na.rm = TRUE, .names = "{.fn}a{.col}")) %>%
+  data.frame(.) %>%
+  mutate_if(is.numeric, round, digits = 2) %>% 
+  pivot_longer(cols = everything(),
+               names_to = c("set", ".value"),
+               names_pattern = "(.+)b(.*)")
+
+```
+
+#### QAnon vs. Non-QAnon
+
+```{r, include=FALSE}
+
+# Descriptive statistics for user features
+descriptives_user_by_qanon <- features_all_unalterd %>%
+  dplyr::select(all_of(names_features_user), qIndicator) %>%
+  group_by(qIndicator) %>%
+  summarize(across(.fns = list(Min = min, Mean = mean, Median = median, Max = max, Sd = sd), na.rm = TRUE, .names = "{.fn}b{.col}")) %>%
+  data.frame(.) %>%
+  mutate_if(is.numeric, round, digits = 2) %>% 
+  pivot_longer(cols = c(-qIndicator),
+               names_to = c("set", ".value"),
+               names_pattern = "(.+)b(.*)")
+
+# Interquartile range account age
+features_all_unalterd %>%
+  select(qIndicator, account_age) %>%
+  group_by(qIndicator) %>%
+  summarize(iqr_75 = quantile(account_age, 0.75),
+            iqr_25 = quantile(account_age, 0.25))
+
+# Descriptive statistics for stylistic features
+descriptives_stylistic_by_qanon <- features_all_unalterd %>%
+  select(all_of(names_features_stylistic), qIndicator) %>%
+  group_by(qIndicator) %>%
+  summarize(across(.fns = list(Min = min, Mean = mean, Median = median, Max = max, Sd = sd), na.rm = TRUE, .names = "{.fn}b{.col}")) %>%
+  data.frame(.) %>%
+  mutate_if(is.numeric, round, digits = 2) %>% 
+  pivot_longer(cols = c(-qIndicator),
+               names_to = c("set", ".value"),
+               names_pattern = "(.+)b(.*)")
+
+# Descriptive statistics for network features
+descriptives_network_by_qanon <- features_all_unalterd %>%
+  dplyr::select(all_of(names_features_network), qIndicator) %>%
+  group_by(qIndicator) %>%
+  summarize(across(.fns = list(Min = min, Mean = mean, Median = median, Max = max, Sd = sd), na.rm = TRUE, .names = "{.fn}a{.col}")) %>%
+  data.frame(.) %>%
+  mutate_if(is.numeric, round, digits = 2) %>% 
+  pivot_longer(cols = c(-qIndicator),
+               names_to = c("set", ".value"),
+               names_pattern = "(.+)a(.*)")
+
+```
+
+### Kolmogorov-Smirnov Test
+
+```{r}
+
+# KS test combined features
+df_ks_user_full <- features_all_unalterd %>%
+  select(qIndicator, all_of(names_features_user)) %>%
+  pivot_longer(cols = -qIndicator)
+
+df_ks_linguistic_full <- features_all_unalterd %>%
+  select(qIndicator, all_of(names_features_stylistic)) %>%
+  pivot_longer(cols = -qIndicator)
+
+df_ks_network_full <- features_all_unalterd %>%
+  select(qIndicator, all_of(names_features_network)) %>%
+  pivot_longer(cols = -qIndicator)
+  
+ks_user_full <- ks.test(df_ks_user_full %>% dplyr::filter(qIndicator == "QAnon") %>% pull(value),
+                        df_ks_user_full %>% dplyr::filter(qIndicator != "QAnon") %>% pull(value))
+
+ks_linguistic_full <- ks.test(df_ks_linguistic_full %>% dplyr::filter(qIndicator == "QAnon") %>% pull(value),
+                              df_ks_linguistic_full %>% dplyr::filter(qIndicator != "QAnon") %>% pull(value))
+
+ks_network_full <- ks.test(df_ks_network_full %>% dplyr::filter(qIndicator == "QAnon") %>% pull(value),
+                           df_ks_network_full %>% dplyr::filter(qIndicator != "QAnon") %>% pull(value))
+
+# KS-Test user features
+ks_user <- vector(mode = "list", length = length(names_features_user))
+names(ks_user) <- names_features_user
+
+for (i in 1:length(names_features_user)) {
+  ks_user[[i]] <- ks.test(features_all_unalterd %>% dplyr::filter(qIndicator == "QAnon") %>% pull(names_features_user[i]),
+                          features_all_unalterd %>% dplyr::filter(qIndicator != "QAnon") %>% pull(names_features_user[i])) %>%
+    tidy() %>% mutate(label = paste0("KS-test: D=", round(statistic, 3), ", p<", format(round(p.value, digits = 3), nsmall = 2)))
+}
+
+map(ks_user, ~ print(.x[["label"]]))
+
+# KS-Test stylisitc features
+ks_stylistic <- vector(mode = "list", length = length(names_features_stylistic))
+names(ks_stylistic) <- names_features_stylistic
+
+for (i in 1:length(names_features_stylistic)) {
+  ks_stylistic[[i]] <- ks.test(features_all_unalterd %>% dplyr::filter(qIndicator == "QAnon") %>% pull(names_features_stylistic[i]),
+                               features_all_unalterd %>% dplyr::filter(qIndicator != "QAnon") %>% pull(names_features_stylistic[i])) %>%
+    tidy() %>% mutate(label = ifelse(p.value < 0.01, paste0("KS-test: D=", round(statistic, 3), ", p<0.01"),                                                             paste0("KS-test: D=", round(statistic, 3), ", p<", format(round(p.value, digits = 2), nsmall = 2))))
+}
+
+map(ks_stylistic, ~ print(.x[["label"]]))
+
+# KS-Test network features
+ks_network <- vector(mode = "list", length = length(names_features_network))
+names(ks_network) <- names_features_network
+
+for (i in 1:length(names_features_network)) {
+  ks_stylistic[[i]] <- ks.test(features_all_unalterd %>% dplyr::filter(qIndicator == "QAnon") %>% pull(names_features_network[i]),
+                               features_all_unalterd %>% dplyr::filter(qIndicator != "QAnon") %>% pull(names_features_network[i])) %>%
+    tidy() %>% mutate(label = ifelse(p.value < 0.01, paste0("KS-test: D=", round(statistic, 3), ", p<0.01"),                                                             paste0("KS-test: D=", round(statistic, 3), ", p<", format(round(p.value, digits = 2), nsmall = 2))))
+}
+
+map(ks_network, ~ print(.x[["label"]]))
+
+```
+
+### Complementary cumulative distribution functions
+
+```{r}
+
+theme_set(
+  theme_bw() +
+    theme(legend.position = c(0.73, 0.9),
+          legend.title = element_blank(), legend.direction="vertical",
+          legend.text = element_text(colour="black", size=30), 
+          legend.background=element_rect(fill="transparent", colour=NA),
+          legend.key = element_rect(fill = "transparent", colour = "transparent"),
+          legend.key.width = unit(1.25, "cm"), legend.key.height = unit(1.25, "cm")
+    ) + 
+    theme(axis.text.x=element_text(colour = "black", size=34, vjust=0.5), 
+          axis.text.y=element_text(colour = "black", size=34, vjust=0.5),
+          axis.title.x=element_text(size=34), 
+          axis.title.y=element_text(size=34, vjust=1.5)
+    ) +
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+)
+
+```
+
+# User features
+
+## CCDF: Account Age
+
+```{r, include = FALSE}
+
+df_plot <- features_all_unalterd %>% group_by(qIndicator) %>% group_modify(~ ccdf(.x$account_age)) %>% arrange(x) %>% 
+  mutate(y = lag(y, default = 1)) %>% ungroup()# %>% mutate(x = x + 1)
+
+plot_stat <- ks.test(features_all_unalterd %>% dplyr::filter(qIndicator == "QAnon") %>% pull(account_age), 
+                     features_all_unalterd %>% dplyr::filter(qIndicator != "QAnon") %>% pull(account_age)) %>% 
+  tidy() %>% mutate(label = ifelse(p.value < 0.01, paste0("KS-test: D=", round(statistic, 3), ", p<0.01"),
+                                                            paste0("KS-test: D=", round(statistic, 3), ", p<", format(round(p.value, digits = 2), nsmall = 2))))
+
+plot_ccdf <- ggplot(df_plot, aes(x = x, y = y, group=qIndicator)) + geom_line(aes(group = qIndicator, color=qIndicator, linetype = qIndicator), size = 1.5) +
+  scale_colour_manual(values=c("#003893", "#CE1126", "#56B4E9"), labels= c("Non-QAnon", "QAnon")) +
+  scale_linetype_discrete(labels= c("Non-QAnon", "QAnon")) + 
+  scale_x_continuous(
+  ) +
+  scale_y_continuous(
+    labels = c("0.001", "0.01", "0.1", "1", "10", "100"),
+    trans = "log10",
+    breaks = c(0.00001, 0.0001, 0.001, 0.01, 0.1, 1),
+    limits = c(0.00001,1),
+    expand = c(0, 0)
+  )  +
+  annotate(geom = "text", x = 220, y = 0.0000175, label = plot_stat$label, parse = F, size = 6) +
+  labs(y = "CCDF (%)", x = "Account age") + 
+  theme(plot.margin=grid::unit(c(5,7,2,5), "mm"))
+
+plot_ccdf
+ggsave(plot_ccdf, file = str_c(path_figures, "account_age_ccdf.pdf"), width = 20, height = 15, units = "cm")
+
+```
+
+## CCDF: Followers
+
+```{r, include = FALSE}
+
+df_plot <- features_all_unalterd %>% group_by(qIndicator) %>% group_modify(~ ccdf(.x$user_followers)) %>% arrange(x) %>% 
+  mutate(y = lag(y, default = 1)) %>% ungroup()# %>% mutate(x = x + 1)
+
+plot_stat <- ks.test(features_all_unalterd %>% dplyr::filter(qIndicator == "QAnon") %>% pull(user_followers), 
+                     features_all_unalterd %>% dplyr::filter(qIndicator != "QAnon") %>% pull(user_followers)) %>% 
+  tidy() %>% mutate(label = ifelse(p.value < 0.01, paste0("KS-test: D=", round(statistic, 3), ", p<0.01"),
+                                                            paste0("KS-test: D=", round(statistic, 3), ", p<", format(round(p.value, digits = 2), nsmall = 2))))
+
+plot_ccdf <- ggplot(df_plot, aes(x = x, y = y, group=qIndicator)) + geom_line(aes(group = qIndicator, color=qIndicator, linetype = qIndicator), size = 1.5) +
+  scale_colour_manual(values=c("#003893", "#CE1126", "#56B4E9"), labels= c("Non-QAnon", "QAnon")) +
+  scale_linetype_discrete(labels= c("Non-QAnon", "QAnon")) + 
+  scale_x_continuous(
+    trans = "log10" ,
+    breaks = c(1:10, seq(20,100,10), seq(200, 1000, 100), seq(2000, 10000, 1000), seq(20000, 100000, 10000), seq(200000, 1000000, 100000), seq(2000000, 10000000, 1000000)),
+     labels = c(1, rep("", 8), 10, rep("", 8), "", rep("", 8), 1000, rep("", 8), "", rep("", 8), "100K", rep("", 8), "", rep("", 8), "10Mio"),
+    limits = c(1, 30000000),
+    expand = c(0, 0.001)
+  ) +
+  scale_y_continuous(
+    labels = c("0.001", "0.01", "0.1", "1", "10", "100"),
+    trans = "log10",
+    breaks = c(0.00001, 0.0001, 0.001, 0.01, 0.1, 1),
+    limits = c(0.00001,1),
+    expand = c(0, 0)
+  )  +
+  annotate(geom = "text", x = 390, y = 0.0000175, label = plot_stat$label, parse = F, size = 8) +
+  labs(y = "CCDF (%)", x = "") +
+  theme(plot.margin=grid::unit(c(5,7,2,5), "mm"))
+
+plot_ccdf
+ggsave(plot_ccdf, file = str_c(path_figures, "user_followers_ccdf.pdf"), width = 20, height = 15, units = "cm")
+
+```
+
+## CCDF: Followees
+
+```{r, include = FALSE}
+
+df_plot <- features_all_unalterd %>% group_by(qIndicator) %>% group_modify(~ ccdf(.x$user_following)) %>% arrange(x) %>% 
+  mutate(y = lag(y, default = 1)) %>% ungroup()# %>% mutate(x = x + 1)
+
+plot_stat <- ks.test(features_all_unalterd %>% dplyr::filter(qIndicator == "QAnon") %>% pull(user_following), 
+                     features_all_unalterd %>% dplyr::filter(qIndicator != "QAnon") %>% pull(user_following)) %>% 
+  tidy() %>% mutate(label = ifelse(p.value < 0.01, paste0("KS-test: D=", round(statistic, 3), ", p<0.01"),
+                                                            paste0("KS-test: D=", round(statistic, 3), ", p<", format(round(p.value, digits = 2), nsmall = 2))))
+
+plot_ccdf <- ggplot(df_plot, aes(x = x, y = y, group=qIndicator)) + geom_line(aes(group = qIndicator, color=qIndicator, linetype = qIndicator), size = 1.5) +
+  scale_colour_manual(values=c("#003893", "#CE1126", "#56B4E9"), labels= c("Non-QAnon", "QAnon")) +
+  scale_linetype_discrete(labels= c("Non-QAnon", "QAnon")) + 
+  scale_x_continuous(
+    trans = "log10" ,
+    breaks = c(1:10, seq(20,100,10), seq(200, 1000, 100), seq(2000, 10000, 1000), seq(20000, 100000, 10000), seq(200000, 1000000, 100000), seq(2000000, 10000000, 1000000)),
+    labels = c(1, rep("", 8), 10, rep("", 8), "", rep("", 8), 1000, rep("", 8), "", rep("", 8), "100K", rep("", 8), "", rep("", 8), "10Mio"),
+    limits = c(1, 1200000),
+    expand = c(0, 0)
+  ) +
+  scale_y_continuous(
+    labels = c("0.001", "0.01", "0.1", "1", "10", "100"),
+    trans = "log10",
+    breaks = c(0.00001, 0.0001, 0.001, 0.01, 0.1, 1),
+    limits = c(0.00001,1),
+    expand = c(0, 0)
+  )  +
+  annotate(geom = "text", x = 150, y = 0.0000175, label = plot_stat$label, parse = F, size = 8) +
+  labs(y = "CCDF (%)", x = "") +
+  theme(plot.margin=grid::unit(c(5,7,2,5), "mm"))
+
+plot_ccdf
+ggsave(plot_ccdf, file = str_c(path_figures, "user_following_ccdf.pdf"), width = 20, height = 15, units = "cm")
+
+```
+
+## CCDF: Posts
+
+```{r, include = FALSE}
+
+df_plot <- features_all_unalterd %>% group_by(qIndicator) %>% group_modify(~ ccdf(.x$user_posts)) %>% arrange(x) %>% 
+  mutate(y = lag(y, default = 1)) %>% ungroup()# %>% mutate(x = x + 1)
+
+plot_stat <- ks.test(features_all_unalterd %>% dplyr::filter(qIndicator == "QAnon") %>% pull(user_posts), 
+                     features_all_unalterd %>% dplyr::filter(qIndicator != "QAnon") %>% pull(user_posts)) %>% 
+  tidy() %>% mutate(label = ifelse(p.value < 0.01, paste0("KS-test: D=", round(statistic, 3), ", p<0.01"),                                                             paste0("KS-test: D=", round(statistic, 3), ", p<", format(round(p.value, digits = 2), nsmall = 2))))
+
+plot_ccdf <- ggplot(df_plot, aes(x = x, y = y, group=qIndicator)) + geom_line(aes(group = qIndicator, color=qIndicator, linetype = qIndicator), size = 1.5) +
+  scale_colour_manual(values=c("#003893", "#CE1126", "#56B4E9"), labels= c("Non-QAnon", "QAnon")) +
+  scale_linetype_discrete(labels= c("Non-QAnon", "QAnon")) + 
+  scale_x_continuous(
+    trans = "log10" ,
+    breaks = c(1:10, seq(20,100,10), seq(200, 1000, 100), seq(2000, 10000, 1000), seq(20000, 100000, 10000), seq(200000, 1000000, 100000), seq(2000000, 10000000, 1000000)),
+    labels = c(1, rep("", 8), 10, rep("", 8), "", rep("", 8), 1000, rep("", 8), "", rep("", 8), "100K", rep("", 8), "", rep("", 8), "10Mio"),
+    limits = c(1, 1300000),
+    expand = c(0, 0)
+  ) +
+  scale_y_continuous(
+    labels = c("0.001", "0.01", "0.1", "1", "10", "100"),
+    trans = "log10",
+    breaks = c(0.00001, 0.0001, 0.001, 0.01, 0.1, 1),
+    limits = c(0.00001,1),
+    expand = c(0, 0)
+  )  +
+  annotate(geom = "text", x = 150, y = 0.0000175, label = plot_stat$label, parse = F, size = 8) +
+  labs(y = "CCDF (%)", x = "") +
+  theme(plot.margin=grid::unit(c(5,7,2,5), "mm"))
+
+plot_ccdf
+ggsave(plot_ccdf, file = str_c(path_figures, "posts_ccdf.pdf"), width = 20, height = 15, units = "cm")
+
+```
+
+## CCDF: Comments
+
+```{r, include = FALSE}
+
+df_plot <- features_all_unalterd %>% group_by(qIndicator) %>% group_modify(~ ccdf(.x$user_comments)) %>% arrange(x) %>% 
+  mutate(y = lag(y, default = 1)) %>% ungroup()# %>% mutate(x = x + 1)
+
+plot_stat <- ks.test(features_all_unalterd %>% dplyr::filter(qIndicator == "QAnon") %>% pull(user_comments), 
+                     features_all_unalterd %>% dplyr::filter(qIndicator != "QAnon") %>% pull(user_comments)) %>% 
+  tidy() %>% mutate(label = ifelse(p.value < 0.01, paste0("KS-test: D=", round(statistic, 3), ", p<0.01"),                                                             paste0("KS-test: D=", round(statistic, 3), ", p<", format(round(p.value, digits = 2), nsmall = 2))))
+
+plot_ccdf <- ggplot(df_plot, aes(x = x, y = y, group=qIndicator)) + geom_line(aes(group = qIndicator, color=qIndicator, linetype = qIndicator), size = 1.5) +
+  scale_colour_manual(values=c("#003893", "#CE1126", "#56B4E9"), labels= c("Non-QAnon", "QAnon")) +
+  scale_linetype_discrete(labels= c("Non-QAnon", "QAnon")) + 
+  scale_x_continuous(
+    trans = "log10" ,
+    breaks = c(1:10, seq(20,100,10), seq(200, 1000, 100), seq(2000, 10000, 1000), seq(20000, 100000, 10000), seq(200000, 1000000, 100000), seq(2000000, 10000000, 1000000)),
+    labels = c(1, rep("", 8), 10, rep("", 8), "", rep("", 8), 1000, rep("", 8), "", rep("", 8), "100K", rep("", 8), "", rep("", 8), "10Mio"),
+    limits = c(1, 200000),
+    expand = c(0, 0)
+  ) +
+  scale_y_continuous(
+    labels = c("0.001", "0.01", "0.1", "1", "10", "100"),
+    trans = "log10",
+    breaks = c(0.00001, 0.0001, 0.001, 0.01, 0.1, 1),
+    limits = c(0.00001,1),
+    expand = c(0, 0)
+  )  +
+  annotate(geom = "text", x = 100, y = 0.0000175, label = plot_stat$label, parse = F, size = 8) +
+  labs(y = "CCDF (%)", x = "") +
+  theme(plot.margin=grid::unit(c(5,7,2,5), "mm"))
+
+plot_ccdf
+ggsave(plot_ccdf, file = str_c(path_figures, "comments_ccdf.pdf"), width = 20, height = 15, units = "cm")
+
+```
+
+## CCDF: Upvotes posts
+
+```{r, include = FALSE}
+
+df_plot <- features_all_unalterd %>% group_by(qIndicator) %>% group_modify(~ ccdf(.x$freq_upvotes_posts)) %>% arrange(x) %>% 
+  mutate(y = lag(y, default = 1)) %>% ungroup()# %>% mutate(x = x + 1)
+
+plot_stat <- ks.test(features_all_unalterd %>% dplyr::filter(qIndicator == "QAnon") %>% pull(freq_upvotes_posts), 
+                     features_all_unalterd %>% dplyr::filter(qIndicator != "QAnon") %>% pull(freq_upvotes_posts)) %>% 
+  tidy() %>% mutate(label = ifelse(p.value < 0.01, paste0("KS-test: D=", round(statistic, 3), ", p<0.01"),                                                             paste0("KS-test: D=", round(statistic, 3), ", p<", format(round(p.value, digits = 2), nsmall = 2))))
+
+plot_ccdf <- ggplot(df_plot, aes(x = x, y = y, group=qIndicator)) + geom_line(aes(group = qIndicator, color=qIndicator, linetype = qIndicator), size = 1.5) +
+  scale_colour_manual(values=c("#003893", "#CE1126", "#56B4E9"), labels= c("Non-QAnon", "QAnon")) +
+  scale_linetype_discrete(labels= c("Non-QAnon", "QAnon")) + 
+  scale_x_continuous(
+    trans = "log10" ,
+    breaks = c(1:10, seq(20,100,10), seq(200, 1000, 100), seq(2000, 10000, 1000), seq(20000, 100000, 10000), seq(200000, 1000000, 100000), seq(2000000, 10000000, 1000000)),
+     labels = c(1, rep("", 8), 10, rep("", 8), 100, rep("", 8), 1000, rep("", 8), "10K", rep("", 8), "100K", rep("", 8), "1Mio", rep("", 8), "10Mio"),
+    limits = c(1, 20000),
+    expand = c(0, 0)
+  ) +
+  scale_y_continuous(
+    labels = c("0.001", "0.01", "0.1", "1", "10", "100"),
+    trans = "log10",
+    breaks = c(0.00001, 0.0001, 0.001, 0.01, 0.1, 1),
+    limits = c(0.00001,1),
+    expand = c(0, 0)
+  )  +
+  annotate(geom = "text", x = 35, y = 0.0000175, label = plot_stat$label, parse = F, size = 8) +
+  labs(y = "CCDF (%)", x = "") +
+  theme(plot.margin=grid::unit(c(5,7,2,5), "mm"))
+
+plot_ccdf
+ggsave(plot_ccdf, file = str_c(path_figures, "upvotes_posts_ccdf.pdf"), width = 20, height = 15, units = "cm")
+
+```
+
+## CCDF: Upvotes comments
+
+```{r, include = FALSE}
+
+df_plot <- features_all_unalterd %>% group_by(qIndicator) %>% group_modify(~ ccdf(.x$freq_upvotes_comments)) %>% arrange(x) %>% 
+  mutate(y = lag(y, default = 1)) %>% ungroup()# %>% mutate(x = x + 1)
+
+plot_stat <- ks.test(features_all_unalterd %>% dplyr::filter(qIndicator == "QAnon") %>% pull(freq_upvotes_comments), 
+                     features_all_unalterd %>% dplyr::filter(qIndicator != "QAnon") %>% pull(freq_upvotes_comments)) %>% 
+  tidy() %>% mutate(label = ifelse(p.value < 0.01, paste0("KS-test: D=", round(statistic, 3), ", p<0.01"),                                                             paste0("KS-test: D=", round(statistic, 3), ", p<", format(round(p.value, digits = 2), nsmall = 2))))
+
+plot_ccdf <- ggplot(df_plot, aes(x = x, y = y, group=qIndicator)) + geom_line(aes(group = qIndicator, color=qIndicator, linetype = qIndicator), size = 1.5) +
+  scale_colour_manual(values=c("#003893", "#CE1126", "#56B4E9"), labels= c("Non-QAnon", "QAnon")) +
+  scale_linetype_discrete(labels= c("Non-QAnon", "QAnon")) + 
+  scale_x_continuous(
+    trans = "log10" ,
+    breaks = c(1:10, seq(20,100,10), seq(200, 1000, 100), seq(2000, 10000, 1000), seq(20000, 100000, 10000), seq(200000, 1000000, 100000), seq(2000000, 10000000, 1000000)),
+     labels = c(1, rep("", 8), 10, rep("", 8), 100, rep("", 8), 1000, rep("", 8), "10K", rep("", 8), "100K", rep("", 8), "1Mio", rep("", 8), "10Mio"),
+    limits = c(1, 1500),
+    expand = c(0, 0)
+  ) +
+  scale_y_continuous(
+    labels = c("0.001", "0.01", "0.1", "1", "10", "100"),
+    trans = "log10",
+    breaks = c(0.00001, 0.0001, 0.001, 0.01, 0.1, 1),
+    limits = c(0.00001,1),
+    expand = c(0, 0)
+  )  +
+  annotate(geom = "text", x = 12, y = 0.0000175, label = plot_stat$label, parse = F, size = 8) +
+  labs(y = "CCDF (%)", x = "") +
+  theme(plot.margin=grid::unit(c(5,7,2,5), "mm"))
+
+plot_ccdf
+ggsave(plot_ccdf, file = str_c(path_figures, "upvotes_comments_ccdf.pdf"), width = 20, height = 15, units = "cm")
+
+```
+
+## CCDF: Impressions
+
+```{r, include = FALSE}
+
+df_plot <- features_all_unalterd %>% group_by(qIndicator) %>% group_modify(~ ccdf(.x$freq_impressions)) %>% arrange(x) %>% 
+  mutate(y = lag(y, default = 1)) %>% ungroup()# %>% mutate(x = x + 1)
+
+plot_stat <- ks.test(features_all_unalterd %>% dplyr::filter(qIndicator == "QAnon") %>% pull(freq_impressions), 
+                     features_all_unalterd %>% dplyr::filter(qIndicator != "QAnon") %>% pull(freq_impressions)) %>% 
+  tidy() %>% mutate(label = ifelse(p.value < 0.01, paste0("KS-test: D=", round(statistic, 3), ", p<0.01"),                                                             paste0("KS-test: D=", round(statistic, 3), ", p<", format(round(p.value, digits = 2), nsmall = 2))))
+
+plot_ccdf <- ggplot(df_plot, aes(x = x, y = y, group=qIndicator)) + geom_line(aes(group = qIndicator, color=qIndicator, linetype = qIndicator), size = 1.5) +
+  scale_colour_manual(values=c("#003893", "#CE1126", "#56B4E9"), labels= c("Non-QAnon", "QAnon")) +
+  scale_linetype_discrete(labels= c("Non-QAnon", "QAnon")) + 
+  scale_x_continuous(
+    trans = "log10" ,
+    breaks = c(1:10, seq(20,100,10), seq(200, 1000, 100), seq(2000, 10000, 1000), seq(20000, 100000, 10000), seq(200000, 1000000, 100000), seq(2000000, 10000000, 1000000)),
+    labels = c(1, rep("", 8), 10, rep("", 8), "", rep("", 8), 1000, rep("", 8), "", rep("", 8), "100K", rep("", 8), "", rep("", 8), "10Mio"),
+    limits = c(1, 5000000),
+    expand = c(0, 0)
+  ) +
+  scale_y_continuous(
+    labels = c("0.001", "0.01", "0.1", "1", "10", "100"),
+    trans = "log10",
+    breaks = c(0.00001, 0.0001, 0.001, 0.01, 0.1, 1),
+    limits = c(0.00001,1),
+    expand = c(0, 0)
+  )  +
+  annotate(geom = "text", x = 170, y = 0.0000175, label = plot_stat$label, parse = F, size = 8) +
+  labs(y = "CCDF (%)", x = "") +
+  theme(plot.margin=grid::unit(c(5,7,2,5), "mm"))
+
+plot_ccdf
+ggsave(plot_ccdf, file = str_c(path_figures, "impressions_ccdf.pdf"), width = 20, height = 15, units = "cm")
+
+```
+
+## CCDF: Downvotes
+
+```{r, include = FALSE}
+
+df_plot <- features_all_unalterd %>% group_by(qIndicator) %>% group_modify(~ ccdf(.x$freq_downvotes_comments)) %>% arrange(x) %>% 
+  mutate(y = lag(y, default = 1)) %>% ungroup()# %>% mutate(x = x + 1)
+
+plot_stat <- ks.test(features_all_unalterd %>% dplyr::filter(qIndicator == "QAnon") %>% pull(freq_downvotes_comments), 
+                     features_all_unalterd %>% dplyr::filter(qIndicator != "QAnon") %>% pull(freq_downvotes_comments)) %>% 
+  tidy() %>% mutate(label = ifelse(p.value < 0.01, paste0("KS-test: D=", round(statistic, 3), ", p<0.01"),                                                             paste0("KS-test: D=", round(statistic, 3), ", p<", format(round(p.value, digits = 2), nsmall = 2))))
+
+plot_ccdf <- ggplot(df_plot, aes(x = x, y = y, group=qIndicator)) + geom_line(aes(group = qIndicator, color=qIndicator, linetype = qIndicator), size = 1.5) +
+  scale_colour_manual(values=c("#003893", "#CE1126", "#56B4E9"), labels= c("Non-QAnon", "QAnon")) +
+  scale_linetype_discrete(labels= c("Non-QAnon", "QAnon")) + 
+  scale_x_continuous(
+    limits = c(0, 50),
+    expand = c(0, 0)
+  ) +
+  scale_y_continuous(
+    labels = c("0.001", "0.01", "0.1", "1", "10", "100"),
+    trans = "log10",
+    breaks = c(0.00001, 0.0001, 0.001, 0.01, 0.1, 1),
+    limits = c(0.00001,1),
+    expand = c(0, 0)
+  )  +
+  annotate(geom = "text", x = 17, y = 0.0000175, label = plot_stat$label, parse = F, size = 8) +
+  labs(y = "CCDF (%)", x = "") +
+  theme(plot.margin=grid::unit(c(5,7,2,5), "mm"))
+
+plot_ccdf
+ggsave(plot_ccdf, file = str_c(path_figures, "downvotes_ccdf.pdf"), width = 20, height = 15, units = "cm")
+
+```
+
+# Stylistic features
+## CCDF: Handles
+
+```{r, include = FALSE}
+
+df_plot <- features_all_unalterd %>% group_by(qIndicator) %>% group_modify(~ ccdf(.x$freq_handle_user)) %>% arrange(x) %>% 
+  mutate(y = lag(y, default = 1)) %>% ungroup()# %>% mutate(x = x + 1)
+
+plot_stat <- ks.test(features_all_unalterd %>% dplyr::filter(qIndicator == "QAnon") %>% pull(freq_handle_user), 
+                     features_all_unalterd %>% dplyr::filter(qIndicator != "QAnon") %>% pull(freq_handle_user)) %>% 
+  tidy() %>% mutate(label = ifelse(p.value < 0.01, paste0("KS-test: D=", round(statistic, 3), ", p<0.01"),                                                             paste0("KS-test: D=", round(statistic, 3), ", p<", format(round(p.value, digits = 2), nsmall = 2))))
+
+plot_ccdf <- ggplot(df_plot, aes(x = x, y = y, group=qIndicator)) + geom_line(aes(group = qIndicator, color=qIndicator, linetype = qIndicator), size = 1.5) +
+  scale_colour_manual(values=c("#003893", "#CE1126", "#56B4E9"), labels= c("Non-QAnon", "QAnon")) +
+  scale_linetype_discrete(labels= c("Non-QAnon", "QAnon")) + 
+  scale_x_continuous(
+    expand = c(0, 0)
+  ) +
+  scale_y_continuous(
+    labels = c("0.001", "0.01", "0.1", "1", "10", "100"),
+    trans = "log10",
+    breaks = c(0.00001, 0.0001, 0.001, 0.01, 0.1, 1),
+    limits = c(0.00001,1),
+    expand = c(0, 0)
+  )  +
+  annotate(geom = "text", x = 28, y = 0.0000175, label = plot_stat$label, parse = F, size = 8) +
+  labs(y = "CCDF (%)", x = "") +
+  theme(plot.margin=grid::unit(c(5,7,2,5), "mm"))
+
+plot_ccdf
+ggsave(plot_ccdf, file = str_c(path_figures, "freq_handle_user_ccdf.pdf"), width = 20, height = 15, units = "cm")
+
+```
+
+## CCDF: Hashtags
+
+```{r, include = FALSE}
+
+df_plot <- features_all_unalterd %>% group_by(qIndicator) %>% group_modify(~ ccdf(.x$freq_hash_user)) %>% arrange(x) %>% 
+  mutate(y = lag(y, default = 1)) %>% ungroup()# %>% mutate(x = x + 1)
+
+plot_stat <- ks.test(features_all_unalterd %>% dplyr::filter(qIndicator == "QAnon") %>% pull(freq_hash_user), 
+                     features_all_unalterd %>% dplyr::filter(qIndicator != "QAnon") %>% pull(freq_hash_user)) %>% 
+  tidy() %>% mutate(label = ifelse(p.value < 0.01, paste0("KS-test: D=", round(statistic, 3), ", p<0.01"),                                                             paste0("KS-test: D=", round(statistic, 3), ", p<", format(round(p.value, digits = 2), nsmall = 2))))
+
+plot_ccdf <- ggplot(df_plot, aes(x = x, y = y, group=qIndicator)) + geom_line(aes(group = qIndicator, color=qIndicator, linetype = qIndicator), size = 1.5) +
+  scale_colour_manual(values=c("#003893", "#CE1126", "#56B4E9"), labels= c("Non-QAnon", "QAnon")) +
+  scale_linetype_discrete(labels= c("Non-QAnon", "QAnon")) + 
+  scale_x_continuous(
+    expand = c(0, 0)
+  ) +
+  scale_y_continuous(
+    labels = c("0.001", "0.01", "0.1", "1", "10", "100"),
+    trans = "log10",
+    breaks = c(0.00001, 0.0001, 0.001, 0.01, 0.1, 1),
+    limits = c(0.00001,1),
+    expand = c(0, 0)
+  )  +
+  annotate(geom = "text", x = 30, y = 0.0000175, label = plot_stat$label, parse = F, size = 8) +
+  labs(y = "CCDF (%)", x = "") +
+  theme(plot.margin=grid::unit(c(5,7,2,5), "mm"))
+
+plot_ccdf
+ggsave(plot_ccdf, file = str_c(path_figures, "freq_hash_user_ccdf.pdf"), width = 20, height = 15, units = "cm")
+
+```
+
+## CCDF: POS
+
+```{r, include = FALSE}
+
+df_plot <- features_all_unalterd %>% group_by(qIndicator) %>% group_modify(~ ccdf(.x$freq_pos_user)) %>% arrange(x) %>% 
+  mutate(y = lag(y, default = 1)) %>% ungroup()# %>% mutate(x = x + 1)
+
+plot_stat <- ks.test(features_all_unalterd %>% dplyr::filter(qIndicator == "QAnon") %>% pull(freq_pos_user), 
+                     features_all_unalterd %>% dplyr::filter(qIndicator != "QAnon") %>% pull(freq_pos_user)) %>% 
+  tidy() %>% mutate(label = ifelse(p.value < 0.01, paste0("KS-test: D=", round(statistic, 3), ", p<0.01"),                                                             paste0("KS-test: D=", round(statistic, 3), ", p<", format(round(p.value, digits = 2), nsmall = 2))))
+
+plot_ccdf <- ggplot(df_plot, aes(x = x, y = y, group=qIndicator)) + geom_line(aes(group = qIndicator, color=qIndicator, linetype = qIndicator), size = 1.5) +
+  scale_colour_manual(values=c("#003893", "#CE1126", "#56B4E9"), labels= c("Non-QAnon", "QAnon")) +
+  scale_linetype_discrete(labels= c("Non-QAnon", "QAnon")) + 
+  scale_x_continuous(
+    expand = c(0, 0)
+  ) +
+  scale_y_continuous(
+    labels = c("0.001", "0.01", "0.1", "1", "10", "100"),
+    trans = "log10",
+    breaks = c(0.00001, 0.0001, 0.001, 0.01, 0.1, 1),
+    limits = c(0.00001,1),
+    expand = c(0, 0)
+  )  +
+  annotate(geom = "text", x = 58, y = 0.0000175, label = plot_stat$label, parse = F, size = 8) +
+  labs(y = "CCDF (%)", x = "") +
+  theme(plot.margin=grid::unit(c(5,7,2,5), "mm"))
+
+plot_ccdf
+ggsave(plot_ccdf, file = str_c(path_figures, "freq_pos_user_ccdf.pdf"), width = 20, height = 15, units = "cm")
+
+```
+
+## CCDF: Long Words
+
+```{r, include = FALSE}
+
+df_plot <- features_all_unalterd %>% group_by(qIndicator) %>% group_modify(~ ccdf(.x$freq_long_words_user)) %>% arrange(x) %>% 
+  mutate(y = lag(y, default = 1)) %>% ungroup()# %>% mutate(x = x + 1)
+
+plot_stat <- ks.test(features_all_unalterd %>% dplyr::filter(qIndicator == "QAnon") %>% pull(freq_long_words_user), 
+                     features_all_unalterd %>% dplyr::filter(qIndicator != "QAnon") %>% pull(freq_long_words_user)) %>% 
+  tidy() %>% mutate(label = ifelse(p.value < 0.01, paste0("KS-test: D=", round(statistic, 3), ", p<0.01"),                                                             paste0("KS-test: D=", round(statistic, 3), ", p<", format(round(p.value, digits = 2), nsmall = 2))))
+
+plot_ccdf <- ggplot(df_plot, aes(x = x, y = y, group=qIndicator)) + geom_line(aes(group = qIndicator, color=qIndicator, linetype = qIndicator), size = 1.5) +
+  scale_colour_manual(values=c("#003893", "#CE1126", "#56B4E9"), labels= c("Non-QAnon", "QAnon")) +
+  scale_linetype_discrete(labels= c("Non-QAnon", "QAnon")) + 
+  scale_x_continuous(
+    limits = c(0, 75),
+    expand = c(0, 0)
+  ) +
+  scale_y_continuous(
+    labels = c("0.001", "0.01", "0.1", "1", "10", "100"),
+    trans = "log10",
+    breaks = c(0.00001, 0.0001, 0.001, 0.01, 0.1, 1),
+    limits = c(0.00001,1),
+    expand = c(0, 0)
+  )  +
+  annotate(geom = "text", x = 24, y = 0.0000175, label = plot_stat$label, parse = F, size = 8) +
+  labs(y = "CCDF (%)", x = "") +
+  theme(plot.margin=grid::unit(c(5,7,2,5), "mm"))
+
+plot_ccdf
+ggsave(plot_ccdf, file = str_c(path_figures, "freq_longwords_user_ccdf.pdf"), width = 20, height = 15, units = "cm")
+
+```
+
+## CCDF: URL
+
+```{r, include = FALSE}
+
+df_plot <- features_all_unalterd %>% group_by(qIndicator) %>% group_modify(~ ccdf(.x$freq_urls)) %>% arrange(x) %>% 
+  mutate(y = lag(y, default = 1)) %>% ungroup()# %>% mutate(x = x + 1)
+
+plot_stat <- ks.test(features_all_unalterd %>% dplyr::filter(qIndicator == "QAnon") %>% pull(freq_urls), 
+                     features_all_unalterd %>% dplyr::filter(qIndicator != "QAnon") %>% pull(freq_urls)) %>% 
+  tidy() %>% mutate(label = ifelse(p.value < 0.01, paste0("KS-test: D=", round(statistic, 3), ", p<0.01"),                                                             paste0("KS-test: D=", round(statistic, 3), ", p<", format(round(p.value, digits = 2), nsmall = 2))))
+
+plot_ccdf <- ggplot(df_plot, aes(x = x, y = y, group=qIndicator)) + geom_line(aes(group = qIndicator, color=qIndicator, linetype = qIndicator), size = 1.5) +
+  scale_colour_manual(values=c("#003893", "#CE1126", "#56B4E9"), labels= c("Non-QAnon", "QAnon")) +
+  scale_linetype_discrete(labels= c("Non-QAnon", "QAnon")) + 
+  scale_x_continuous(
+    breaks = seq(0, 1, 0.2),
+    labels = c(0, seq(0.2, 0.8, 0.2), 1),
+    limits = c(0, 1),
+    expand = c(0, 0)
+  ) +
+  scale_y_continuous(
+    labels = c("0.001", "0.01", "0.1", "1", "10", "100"),
+    trans = "log10",
+    breaks = c(0.00001, 0.0001, 0.001, 0.01, 0.1, 1),
+    limits = c(0.00001,1),
+    expand = c(0, 0)
+  )  +
+   annotate(geom = "text", x = 0.365, y = 0.0000175, label = plot_stat$label, parse = F, size = 8) +
+  labs(y = "CCDF (%)", x = "") + 
+   theme(plot.margin=grid::unit(c(5,7,2,5), "mm"))
+
+plot_ccdf
+ggsave(plot_ccdf, file = str_c(path_figures, "freq_urls_ccdf.pdf"), width = 20, height = 15, units = "cm")
+
+```
+
+## CCDF: Sentiment
+
+```{r, include = FALSE}
+
+df_plot <- features_all_unalterd %>% group_by(qIndicator) %>% group_modify(~ ccdf(.x$user_sentiment)) %>% arrange(x) %>% 
+  mutate(y = lag(y, default = 1)) %>% ungroup()# %>% mutate(x = x + 1)
+
+plot_stat <- ks.test(features_all_unalterd %>% dplyr::filter(qIndicator == "QAnon") %>% pull(user_sentiment), 
+                     features_all_unalterd %>% dplyr::filter(qIndicator != "QAnon") %>% pull(user_sentiment)) %>% 
+  tidy() %>% mutate(label = ifelse(p.value < 0.01, paste0("KS-test: D=", round(statistic, 3), ", p<0.01"),                                                             paste0("KS-test: D=", round(statistic, 3), ", p<", format(round(p.value, digits = 2), nsmall = 2))))
+
+plot_ccdf <- ggplot(df_plot, aes(x = x, y = y, group=qIndicator)) + geom_line(aes(group = qIndicator, color=qIndicator, linetype = qIndicator), size = 1.5) +
+  scale_colour_manual(values=c("#003893", "#CE1126", "#56B4E9"), labels= c("Non-QAnon", "QAnon")) +
+  scale_linetype_discrete(labels= c("Non-QAnon", "QAnon")) + 
+  scale_x_continuous(
+    limits = c(-1, 3),
+    expand = c(0, 0)
+  ) +
+  scale_y_continuous(
+    labels = c("0.001", "0.01", "0.1", "1", "10", "100"),
+    trans = "log10",
+    breaks = c(0.00001, 0.0001, 0.001, 0.01, 0.1, 1),
+    limits = c(0.00001,1),
+    expand = c(0, 0)
+  )  +
+  annotate(geom = "text", x = 0.4, y = 0.0000175, label = plot_stat$label, parse = F, size = 8) +
+  labs(y = "CCDF (%)", x = "") +
+  theme(plot.margin=grid::unit(c(5,7,2,5), "mm"))
+
+plot_ccdf
+ggsave(plot_ccdf, file = str_c(path_figures, "sentiment_user_ccdf.pdf"), width = 20, height = 15, units = "cm")
+
+```
+
+## CCDF: Toxicity
+
+```{r, include = FALSE}
+
+df_plot <- features_all_unalterd %>% group_by(qIndicator) %>% group_modify(~ ccdf(.x$TOXICITY)) %>% arrange(x) %>% 
+  mutate(y = lag(y, default = 1)) %>% ungroup()# %>% mutate(x = x + 1)
+
+plot_stat <- ks.test(features_all_unalterd %>% dplyr::filter(qIndicator == "QAnon") %>% pull(TOXICITY), 
+                     features_all_unalterd %>% dplyr::filter(qIndicator != "QAnon") %>% pull(TOXICITY)) %>% 
+  tidy() %>% mutate(label = ifelse(p.value < 0.01, paste0("KS-test: D=", round(statistic, 3), ", p<0.01"),                                                             paste0("KS-test: D=", round(statistic, 3), ", p<", format(round(p.value, digits = 2), nsmall = 2))))
+
+plot_ccdf <- ggplot(df_plot, aes(x = x, y = y, group=qIndicator)) + geom_line(aes(group = qIndicator, color=qIndicator, linetype = qIndicator), size = 1.5) +
+  scale_colour_manual(values=c("#003893", "#CE1126", "#56B4E9"), labels= c("Non-QAnon", "QAnon")) +
+  scale_linetype_discrete(labels= c("Non-QAnon", "QAnon")) + 
+  scale_x_continuous(
+    breaks = seq(0, 1, 0.2),
+    labels = c(0, seq(0.2, 0.8, 0.2), 1),
+    limits = c(0, 1),
+    expand = c(0, 0)
+  ) +
+  scale_y_continuous(
+    labels = c("0.001", "0.01", "0.1", "1", "10", "100"),
+    trans = "log10",
+    breaks = c(0.00001, 0.0001, 0.001, 0.01, 0.1, 1),
+    limits = c(0.00001,1),
+    expand = c(0, 0)
+  )  +
+  annotate(geom = "text", x = 0.365, y = 0.0000175, label = plot_stat$label, parse = F, size = 8) +
+  labs(y = "CCDF (%)", x = "") +
+  theme(plot.margin=grid::unit(c(5,7,2,5), "mm"))
+
+plot_ccdf
+ggsave(plot_ccdf, file = str_c(path_figures, "toxicity_ccdf.pdf"), width = 20, height = 15, units = "cm")
+
+```
+
+## CCDF: Threat
+
+```{r, include = FALSE}
+
+df_plot <- features_all_unalterd %>% group_by(qIndicator) %>% group_modify(~ ccdf(.x$THREAT)) %>% arrange(x) %>% 
+  mutate(y = lag(y, default = 1)) %>% ungroup()# %>% mutate(x = x + 1)
+
+plot_stat <- ks.test(features_all_unalterd %>% dplyr::filter(qIndicator == "QAnon") %>% pull(THREAT), 
+                     features_all_unalterd %>% dplyr::filter(qIndicator != "QAnon") %>% pull(THREAT)) %>% 
+  tidy() %>% mutate(label = ifelse(p.value < 0.01, paste0("KS-test: D=", round(statistic, 3), ", p<0.01"),                                                             paste0("KS-test: D=", round(statistic, 3), ", p<", format(round(p.value, digits = 2), nsmall = 2))))
+
+plot_ccdf <- ggplot(df_plot, aes(x = x, y = y, group=qIndicator)) + geom_line(aes(group = qIndicator, color=qIndicator, linetype = qIndicator), size = 1.5) +
+  scale_colour_manual(values=c("#003893", "#CE1126", "#56B4E9"), labels= c("Non-QAnon", "QAnon")) +
+  scale_linetype_discrete(labels= c("Non-QAnon", "QAnon")) + 
+  scale_x_continuous(
+    breaks = seq(0, 1, 0.2),
+    labels = c(0, seq(0.2, 0.8, 0.2), 1),
+    limits = c(0, 1),
+    expand = c(0, 0)
+  ) +
+  scale_y_continuous(
+    labels = c("0.001", "0.01", "0.1", "1", "10", "100"),
+    trans = "log10",
+    breaks = c(0.00001, 0.0001, 0.001, 0.01, 0.1, 1),
+    limits = c(0.00001,1),
+    expand = c(0, 0)
+  )  +
+  annotate(geom = "text", x = 0.365, y = 0.0000175, label = plot_stat$label, parse = F, size = 8) +
+  labs(y = "CCDF (%)", x = "") +
+  theme(plot.margin=grid::unit(c(5,7,2,5), "mm"))
+
+plot_ccdf
+ggsave(plot_ccdf, file = str_c(path_figures, "threat_ccdf.pdf"), width = 20, height = 15, units = "cm")
+
+```
+
+## CCDF: Profanity
+
+```{r, include = FALSE}
+
+df_plot <- features_all_unalterd %>% group_by(qIndicator) %>% group_modify(~ ccdf(.x$PROFANITY)) %>% arrange(x) %>% 
+  mutate(y = lag(y, default = 1)) %>% ungroup()# %>% mutate(x = x + 1)
+
+plot_stat <- ks.test(features_all_unalterd %>% dplyr::filter(qIndicator == "QAnon") %>% pull(PROFANITY), 
+                     features_all_unalterd %>% dplyr::filter(qIndicator != "QAnon") %>% pull(PROFANITY)) %>% 
+  tidy() %>% mutate(label = ifelse(p.value < 0.01, paste0("KS-test: D=", round(statistic, 3), ", p<0.01"),                                                             paste0("KS-test: D=", round(statistic, 3), ", p<", format(round(p.value, digits = 2), nsmall = 2))))
+
+plot_ccdf <- ggplot(df_plot, aes(x = x, y = y, group=qIndicator)) + geom_line(aes(group = qIndicator, color=qIndicator, linetype = qIndicator), size = 1.5) +
+  scale_color_manual(values=c("#003893", "#CE1126", "#56B4E9"), labels= c("Non-QAnon", "QAnon")) +
+  scale_linetype_discrete(labels= c("Non-QAnon", "QAnon")) + 
+  scale_x_continuous(
+    breaks = seq(0, 1, 0.2),
+    labels = c(0, seq(0.2, 0.8, 0.2), 1),
+    limits = c(0, 1),
+    expand = c(0, 0)
+  ) +
+  scale_y_continuous(
+    labels = c("0.001", "0.01", "0.1", "1", "10", "100"),
+    trans = "log10",
+    breaks = c(0.00001, 0.0001, 0.001, 0.01, 0.1, 1),
+    limits = c(0.00001,1),
+    expand = c(0, 0)
+  )  +
+  annotate(geom = "text", x = 0.365, y = 0.0000175, label = plot_stat$label, parse = F, size = 8) +
+  labs(y = "CCDF (%)", x = "") +
+  theme(plot.margin=grid::unit(c(5,7,2,5), "mm"))
+
+plot_ccdf
+ggsave(plot_ccdf, file = str_c(path_figures, "profanity_ccdf.pdf"), width = 20, height = 15, units = "cm")
+
+```
+
+## Violin Plot
+
+# Account Age
+
+```{r}
+
+df_plot <- features_all_unalterd %>%
+  select(qIndicator, account_age) %>%
+  mutate(qAnon = factor(qIndicator, labels = c("Non-QAnon", "QAnon")))
+
+plot_stat <- ks.test(features_all_unalterd %>% dplyr::filter(qIndicator == "QAnon") %>% pull(account_age), 
+                     features_all_unalterd %>% dplyr::filter(qIndicator != "QAnon") %>% pull(account_age)) %>% 
+  tidy() %>% mutate(label = ifelse(p.value < 0.01, paste0("KS-test: D=", round(statistic, 3), ", p<0.01"),                                                             paste0("KS-test: D=", round(statistic, 3), ", p<", format(round(p.value, digits = 2), nsmall = 2))))
+
+# Boxplot
+plot_box <- ggplot(df_plot, aes(x = qAnon, y = account_age, fill = qAnon)) +
+  geom_violin(color="black") +
+  geom_errorbar(stat = "summary",
+                fun.min = function(z) {quantile(z,0.25)},
+                fun.max = function(z) {quantile(z,0.75)}, width = 0.05,
+                color="white",
+                width = 1.5) +
+  geom_point(stat = "summary",
+             fun = median,
+             color = "white") +
+  scale_fill_manual(values=c("#003893", "#CE1126", "#56B4E9"), labels= c("Non-QAnon", "QAnon")) +
+  theme(
+    legend.position = "none"
+  ) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  ylab("Account age") +
+  xlab("")
+
+plot_box
+ggsave(plot_box, file = str_c(path_figures, "account_age_violin.pdf"), width = 20, height = 15, units = "cm")
+
+```
+
+## Account age vs. followers
+
+```{r}
+
+df_plot <- features_all_unalterd %>%
+  dplyr::select(creator, account_age, user_followers, qIndicator) %>%
+  mutate(intervals = cut_width(account_age, width = 30, ordered_result = TRUE)) %>%
+  group_by(intervals, qIndicator) %>%
+  summarize(lquartile_followers = quantile(user_followers, 0.25),
+            median_followers = median(user_followers),
+            uquartile_followers = quantile(user_followers, 0.75)) %>%
+  ungroup() %>%
+  mutate(test = as.numeric(str_remove(str_extract(as.character(intervals), pattern = ",\\d+"), ",")))
+
+plot_age <- ggplot(data = df_plot, aes(x = test, y = median_followers, group = qIndicator, color = qIndicator, fill = qIndicator)) +
+  geom_point() +
+  geom_line(aes(linetype = qIndicator)) +
+  geom_ribbon(aes(ymin = lquartile_followers, ymax = uquartile_followers, fill = qIndicator), alpha = 0.2, linetype = 0) +
+  scale_fill_manual(values=c("#003893", "#CE1126", "#56B4E9"), labels= c("Non-QAnon", "QAnon")) +
+  scale_linetype_discrete(labels= c("Non-QAnon", "QAnon")) +
+  scale_color_manual(values=c("#003893", "#CE1126", "#56B4E9"), labels= c("Non-QAnon", "QAnon")) +
+  scale_x_continuous(
+    limits = c(15, 800),
+    expand = c(0, 20)
+  ) +
+  scale_y_continuous(
+    limits = c(0, 4000)
+  ) +
+  theme_bw() +
+    theme(legend.position = c(0.78, 0.9),
+          legend.title = element_blank(), legend.direction="vertical",
+          legend.text = element_text(colour="black", size=24), 
+          legend.background=element_rect(fill="transparent", colour=NA),
+          legend.key = element_rect(fill = "transparent", colour = "transparent"),
+          legend.key.width = unit(1.25, "cm"), legend.key.height = unit(1.25, "cm")
+    ) + 
+    theme(axis.text.x=element_text(colour = "black", size=24, vjust=0.5), 
+          axis.text.y=element_text(colour = "black", size=24, vjust=0.5),
+          axis.title.x=element_text(size=24), 
+          axis.title.y=element_text(size=24, vjust=1.5)
+    ) +
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  xlab("Account age") +
+  ylab("Followers")
+
+plot_age
+ggsave(plot_age, file = str_c(path_figures, "account_age_followers.pdf"), width = 20, height = 15, units = "cm")
+
+```
+
+## Account age vs. followees
+
+```{r}
+
+df_plot <- features_all_unalterd %>%
+  dplyr::select(creator, account_age, user_following, qIndicator) %>%
+  mutate(intervals = cut_width(account_age, width = 30, ordered_result = TRUE)) %>%
+  group_by(intervals, qIndicator) %>%
+  summarize(lquartile_followees = quantile(user_following, 0.25),
+            median_followees = median(user_following),
+            uquartile_followees = quantile(user_following, 0.75)) %>%
+  ungroup() %>%
+  mutate(test = as.numeric(str_remove(str_extract(as.character(intervals), pattern = ",\\d+"), ",")))
+
+plot_age <- ggplot(data = df_plot, aes(x = test, y = median_followees, group = qIndicator, color = qIndicator, fill = qIndicator)) +
+  geom_point() +
+  geom_line(aes(linetype = qIndicator)) +
+  geom_ribbon(aes(ymin = lquartile_followees, ymax = uquartile_followees, fill = qIndicator), alpha = 0.2, linetype = 0) +
+  scale_fill_manual(values=c("#003893", "#CE1126", "#56B4E9"), labels= c("Non-QAnon", "QAnon")) +
+  scale_linetype_discrete(labels= c("Non-QAnon", "QAnon")) +
+  scale_color_manual(values=c("#003893", "#CE1126", "#56B4E9"), labels= c("Non-QAnon", "QAnon")) +
+  scale_x_continuous(
+    limits = c(15, 800),
+    expand = c(0, 20)
+  ) +
+  scale_y_continuous(
+    limits = c(0, 4500)
+  ) +
+  theme_bw() +
+    theme(legend.position = c(0.78, 0.9),
+          legend.title = element_blank(), legend.direction="vertical",
+          legend.text = element_text(colour="black", size=24), 
+          legend.background=element_rect(fill="transparent", colour=NA),
+          legend.key = element_rect(fill = "transparent", colour = "transparent"),
+          legend.key.width = unit(1.25, "cm"), legend.key.height = unit(1.25, "cm")
+    ) + 
+    theme(axis.text.x=element_text(colour = "black", size=24, vjust=0.5), 
+          axis.text.y=element_text(colour = "black", size=24, vjust=0.5),
+          axis.title.x=element_text(size=24), 
+          axis.title.y=element_text(size=24, vjust=1.5)
+    ) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) +
+  xlab("Account age") +
+  ylab("Followees")
+
+plot_age
+ggsave(plot_age, file = str_c(path_figures, "account_age_followees.pdf"), width = 20, height = 15, units = "cm")
+
+```
+
+### Bio
+
+#### Overall
+
+```{r, include = FALSE}
+
+# Word counts (Overall)
+user_count <- user_bio_qanon %>%
+  count(token, sort = TRUE) %>%
+  top_n(10)
+
+# Word clouds (Overall)
+user_wc <- wordcloud(user_count$token, user_count$n, max.words = 100)
+
+# Bar graphs (Overall)
+user_bar <- user_count %>%
+  top_n(10) %>%
+  ggplot(aes(x = fct_reorder(token, n), y = n)) +
+  geom_col() +
+  coord_flip() +
+  theme_bw() +
+  xlab("Count") +
+  ylab("Term")
+ggsave(str_c("./../doc/figures/", "user_bar", ".pdf"))
+
+```
+
+#### QAnon vs. Non-Qanon
+
+```{r, include = FALSE}
+
+# Word counts (QAnon vs. Non-Qanon)
+user_count_by_qanon <- user_bio_qanon %>%
+  group_by(user_id) %>%
+  mutate(qAnon = ifelse(sum(qIndicator) == 0, 0, 1),
+         qAnon = factor(qAnon, levels = c(0,1), labels = c("Non-QAnon", "QAnon"))) %>%
+  group_by(qAnon) %>%
+  count(token, sort = TRUE) %>%
+  top_n(10)
+
+user_count_by_qanon %>%
+  top_n(10) %>%
+  t()
+
+# Table word counts by group (QAnon vs. Non-Qanon)
+user_count_table <- user_count_by_qanon %>%
+  slice_max(order_by = n, n = 3) %>%
+  group_split() %>%
+  map_dfc(identity)
+
+# Word clouds (QAnon vs. Non-Qanon)
+user_wc_by_qanon <- user_count_by_qanon %>%
+  group_by(qAnon) %>%
+  group_split() %>%
+  map(~ wordcloud(words = .x$token, freq = .x$n, max.words = 100))
+
+# Bar graphs (QAnon vs. Non-Qanon)
+user_bar_by_qanon <- user_count_by_qanon %>%
+  group_by(qAnon) %>%
+  top_n(3) %>%
+  ungroup %>%
+  mutate(token = reorder_within(token, n, qAnon)) %>%
+  ggplot(aes(x = token, y = n)) +
+  facet_wrap(vars(qAnon), scales = "free") +
+  geom_col() +
+  coord_flip() +
+  theme_bw() +
+  scale_x_reordered() +
+  xlab("Count") +
+  ylab("Term")
+ggsave(str_c(path_figures, "user_bar_by_qanon", ".pdf"))
+
+```
+
+# Content 
+### QAnon vs. Non-Qanon
+
+```{r, include = FALSE}
+
+clean_annotation <- function(path_input, file_name){
+  # Read files
+  dta <- read_rds(str_c(path_input, file_name))
+  
+  # Clean file
+  dta_clean <- dta %>%
+    filter(!str_detect(token, pattern = "@")) %>%
+    mutate(token = str_remove(token, pattern = "#")) %>%
+    anti_join(stop, by = c("token" = "word")) %>%
+    left_join(user_qanon, by = "creator") %>%
+    group_by(comment_id) %>%
+    mutate(qAnon = ifelse(sum(qIndicator) == 0, 0, 1),
+         qAnon = factor(qAnon, levels = c(0,1), labels = c("Non-QAnon", "QAnon"))) %>%
+    group_by(qAnon) %>%
+    count(token, sort = TRUE) #%>%
+    #top_n(100)
+  
+  # Save cleaned file
+  write_rds(dta_clean, file = str_c(path_dss, "output/words/", "words_", parse_number(file_name), ".RDS"))
+  
+  rm(dta, dta_clean)
+}
+
+# Clean files
+list.files(path = str_c(path_dss, "output/annotation/"), pattern = "*RDS") %>%
+  future_map(~ clean_annotation(path_input = str_c(path_dss, "output/annotation/"), file_name = .x)) 
+
+words_count <- list.files(path = str_c(path_dss, "output/words/"), pattern = "*RDS") %>%
+  future_map_dfr(~ read_rds(str_c(path_dss, "output/words/", .x))) %>%
+  group_by(qAnon, token) %>%
+  summarize(total = sum(n)) %>%
+  arrange(desc(total))
+
+write_rds(words, file = "words_count.RDS")
+
+```
+
+# Visualization: Frequency words
+
+```{r plots, include=FALSE, echo=FALSE}
+
+# Barplot (QAnon vs. Non-Qanon)
+df_plot <- words_count %>%
+  group_by(qAnon) %>%
+  top_n(10) %>%
+  ungroup %>%
+  mutate(token = reorder_within(token, total, qAnon))
+
+my_breaks <- function(x) { if (max(x) < 500000) seq(0, 500000, 100000) else seq(0, 13000000, 1000000) }
+my_labels <- function(x) { if (max(x, na.rm = TRUE) < 500000) c(0, "100K", rep("", 2), "400K", "") else c("0", rep("", 4), "5Mio", rep("", 4), "10Mio", rep("",3)) }
+
+bar_plot <- ggplot(data = df_plot, aes(x = token, y = total, fill = qAnon)) +
+  facet_wrap(vars(qAnon), scales = "free") +
+  geom_col(width = 0.8) +
+  scale_fill_manual(values=c("#003893", "#CE1126", "#56B4E9"), labels= c("Non-QAnon", "QAnon")) +
+  scale_alpha_manual(c(0.5, 0.5)) +
+  coord_flip() +
+  scale_x_reordered() +
+  scale_y_continuous(
+    breaks = my_breaks,
+    labels = my_labels
+    ) +
+  theme_bw() +
+  theme(
+    text = element_text(size = 14),
+    legend.position = "none"
+  ) +
+  xlab("") +
+  ylab("")
+ggsave(str_c(path_figures, "content_bar_by_qanon", ".pdf"), width = 15, height = 10, units = "cm")
+
+```

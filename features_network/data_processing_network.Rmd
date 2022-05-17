@@ -1,0 +1,155 @@
+---
+title: "preprocessing for network features"
+author: "Dominik Bär"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Set up environment
+
+```{r}
+
+# Set Seed
+set.seed(1234)
+
+library(tidyverse)
+library(doParallel)
+library(furrr)
+library(corpus)
+
+# Path to origninal Parler data files
+path_input  <- "../../../Data/input/"
+
+# Path for new datasets
+path_output <- "../../../Data/output/features_network/"
+
+# Data content
+file_list_content <- list.files(path =  str_c(path_input, "parleys_user/"), pattern = "RDS")
+# Data user
+file_list_user <- list.files(path = str_c(path_input, "parler_users/"), pattern = "NDJSON")
+
+```
+
+# Customized functions
+
+```{r, include = False}
+
+# Read specific columns of ndjson files
+read_rds_column <- function(filename, col_name){
+  
+  data <- read_rds(filename) %>%
+    select(all_of(col_name))
+  
+  print(str_c("Processed file", filename))
+  
+  return(data)
+
+}
+
+```
+
+## Load data
+
+```{r, include = FALSE}
+
+# Load user metadata
+# user_data <- file_list_user %>%
+#   map(~ str_c(path_input, "parler_users/", .x)) %>%
+#   future_map(~ read_ndjson_column(.x, col_name = c("username", "id", "posts", "comments")), .progress = TRUE) %>%
+#   bind_rows() %>%
+#   rename("creator" = "id")
+# 
+# save(user_data, file = str_c(path_output, "user_data.Rdata"))
+
+load("../../../Data/AltTech/user_data.Rdata")
+
+# Join Qanon data
+load("../../../data/output/data_qanon_user.rdata")
+
+data_qanon_user <- data_qanon_user %>%
+  left_join(subset(user_data, select = c(creator, username)), by = "creator")
+
+# Load content
+# content <- file_list_content %>%
+#   map(~ str_c(path_input, "parleys_user/", .x)) %>%
+#   map(~ read_rds_column(.x, col_name = c("creator", "id", "parent")), .progress = TRUE)
+
+load(str_c(path_output, "content_network.Rdata"))
+
+```
+
+## Find unique parent ids
+
+```{r}
+
+# Select unique parent ids, i.e. root post of comment/repost
+parent_ids <- content %>%
+  map(~ .x %>% distinct(parent)) %>%
+  bind_rows() %>%
+  distinct(parent)
+
+save(parent_ids, file = str_c(path_output, "parent_ids.Rdata"))
+
+df_parent <- content %>%
+  map(~ select(.x, -parent)) %>%
+  map(~ inner_join(.x, parent_ids, by = c("id" = "parent"))) %>%
+  bind_rows() %>%
+  rename("parent_id" = "id")
+
+save(df_parent, file = str_c(path_output, "df_parent_id.Rdata"))
+
+```
+
+## Create node list
+
+```{r}
+
+user_list_content <- content %>%
+  map(~ .x %>% distinct(creator)) %>%
+  bind_rows() %>%
+  distinct(creator) %>%
+  rowid_to_column("id")
+
+save(user_list_content, file = str_c(path_output, "user_list_content.Rdata"))
+
+user_list <- user_list_content %>%
+  left_join(data_qanon_user, by = "creator") %>%
+  select(id, username, qIndicator, creator, posts, comments) %>%
+  rename("label" = "username")
+
+save(user_list, file = str_c(path_output, "user_list.Rdata"))
+write_csv(user_list, file = str_c(path_output, "user_list.csv"))
+
+nodes <- user_list %>%
+  select(id, label)
+
+```
+
+## Create edge list
+
+```{r}
+
+# Merge reply (i.e. repost/comment) with origin
+connections <- content %>%
+  map(~ inner_join(.x, df_parent, by = c("parent" = "parent_id"))) %>%
+  bind_rows() %>%
+  rename("creator_reply" = "creator.x", "creator_origin" = "creator.y")
+
+save(connections, file = str_c(path_output, "connections.Rdata"))
+write_csv(connections, file = str_c(path_output, "connections.csv"))
+
+# Count interactions
+interactions <- connections %>%
+  group_by(creator_origin, creator_reply) %>%
+  summarize(weights = n()) %>%
+  ungroup() %>%
+  #filter(weights >= 100) %>%
+  filter(creator_origin != creator_reply)
+
+save(interactions, file = str_c(path_output, "interactions.Rdata"))
+write_csv(interactions, file = str_c(path_output, "interactions.csv"))
+
+```

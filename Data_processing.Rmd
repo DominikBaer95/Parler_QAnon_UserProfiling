@@ -1,0 +1,494 @@
+---
+title: "Parler_Data_Processing"
+author: "Dominik Bär"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(include = FALSE, message = FALSE, results = "hide")
+```
+
+# ##################################################################################################################
+#    File to sample QAnon users from data_users and retrieve their posts/comments from parler_data
+#        - Find unique users that posted
+#        - Match users with metadata
+#        - Identify QAnon users based on "biography"
+#        - Sample appropriate number of QAnon and non-QAnon users and retrieve thir posts/comments from parler_data
+# ##################################################################################################################
+
+# Libraries
+
+```{r library, include=FALSE}
+
+library(tidyverse)
+library(lubridate)
+library(corpus)
+library(tidytext)
+library(textclean)
+library(stopwords)
+library(doParallel)
+library(furrr)
+library(udpipe)
+library(cld2)
+library(cld3)
+library(sentimentr)
+library(caret)
+library(smotefamily)
+
+#Python setup
+library(reticulate)
+imbllearn = reticulate::import("imblearn")
+
+```
+
+# Directories
+
+```{r paths, include = FALSE}
+
+# Set Seed
+set.seed(1234)
+
+# Input data
+path_input <- "./../data/input/"
+# Output data
+path_output <- "./../data/output/"
+
+# Data content
+file_list_content <- list.files(path =  str_c(path_input, "parler_data/"), pattern = "*.Rdata")
+# Data user 
+file_list_user <- list.files(path =  str_c(path_input, "parler_users/"), pattern = "*.ndjson") 
+# Content by user
+file_list_content_by_user <- list.files(path = str_c(path_input, "parleys_user/"), pattern = "*.RDS")
+
+```
+
+# Important variables
+
+```{r, include = FALSE}
+
+# Important variables content
+content_vars <- c("id", "comments", "body", "bodywithurls", "createdAtformatted", "creator", "datatype", "hashtags", "media", "upvotes", "impressions", "reposts", "downvotes", "score", "urls")
+
+# Important variables user
+user_vars <- c("id", "key", "bio", "comments", "datatype", "user_followers", "user_following", "joined", "likes", "posts")
+
+# Define vector with QAnon indicators
+qanon_indicator <- c("anons", "anon", "qanons", "qanon", " q ", "thegreatawakening", "greatawakening", "wwg1wga", "wgaworldwide", "qarmy", "obamagate", "pizzagate", "savethechildren", "saveourchildren", "taketheoath", "deep state", "deepstate", "deepstatecoup", "deepstatecabal", "deepstateexposed", "plandemic", "scamdemic", "sheepnomore", "adrenochrome", "thestorm", "followthewhiterabbit", "downtherabbithole", "thesepeoplearesick", "wearethenewsnow", "pizzagateisreal", "thestormisuponus", "newworldorder", "darktolight", "clintonbodycount")
+
+# Import udpipe model for data annotation ("english")
+udmodel <- udpipe_download_model(language = "english")
+udmodel_en <- udpipe_load_model(file = udmodel$file_model)
+
+# Remove "q" from stopwords
+stop <- stop_words[stop_words$word != "q", ]
+
+# Vector of important POS-tags
+pos_tags <- c("NOUN", "PROPN", "PRON", "ADJ", "ADV", "VERB", "AUX", "ADP", "DET")
+
+# Proportion of data in training sample
+p_train <- 0.8
+
+```
+
+# Feature names
+
+```{r}
+
+# Vector with feature names
+names_features_user <- c("account_age", "user_followers", "user_following" , "user_posts", "user_comments", "freq_upvotes_posts", "freq_impressions", "freq_upvotes_comments", "freq_downvotes_comments")
+names_features_stylistic <- c("freq_handle_user", "freq_hash_user", "freq_pos_user", "freq_long_words_user", "freq_urls", "user_sentiment")
+names_features_text <- str_c("text", c(0:383))
+names_features_all <- c(names_features_user, names_features_stylistic, names_features_text)
+
+```
+
+# Dataset names
+
+```{r}
+
+# List of samples
+data_names <- c("ADASYN", "SmoteTomek")
+
+```
+
+# Customized functions
+
+```{r, include = False}
+
+# Read specific columns of Rdata files
+read_rdata_column <- function(filename, col_name){
+  load(filename)
+  out <- dta %>%
+    select(all_of(col_name))
+  return(out)
+}
+
+# Read specific columns of Rdata files and join with dataset
+read_rdata_column_join <- function(filename, col_name, join_dta, key){
+  load(filename) 
+  out <- dta %>%
+    select(all_of(col_name)) %>%
+    inner_join(join_dta, by = key)
+  return(out)
+}
+
+# Read specific columns of ndjson files
+read_ndjson_column <- function(filename, col_name){
+  data <- read_ndjson(filename, mmap = TRUE) %>%
+    select(all_of(col_name))
+}
+
+# Annotate splitted text data
+annotate_splits <- function(x, var) {
+  x <- udpipe_annotate(udmodel_en, x[[var]])
+  out <- as.data.frame(x) %>% select(doc_id, token, upos)
+  return(out)
+}
+
+```
+
+# Import content and identify unique users 
+
+```{r, include = FALSE}
+
+# Load content
+content <- file_list_content %>%
+  map(~ str_c(path_input, "parler_data/", .x)) %>%
+  future_map(~ read_rdata_column(.x, c("creator", "body")), .progress = TRUE)
+
+# Select unique users, i.e. users posted at least once & body != ""
+unique_user_content <- content %>%
+  bind_rows() %>%
+  #select(creator, body) %>%
+  distinct(creator)
+
+save(unique_user_content, file = str_c(path_output, "unique_user_content.Rdata"))
+
+```
+
+# Load user metadata for unique users
+
+```{r, include = FALSE}
+
+user_data <- file_list_user %>%
+  map(~ str_c(path_input, "parler_users/", .x)) %>%
+  future_map(~ read_ndjson_column(.x, col_name = user_vars), .progress = TRUE) %>%
+  bind_rows()
+
+save(user_data, file = str_c(path_output, "user_data.Rdata"))
+  
+relevant_user <- user_data %>%
+  filter(datatype == "user_profile") %>%
+  inner_join(unique_user_content, by = c("id" = "creator"), keep = TRUE) %>%
+  select(-c("id", "key"))
+
+save(relevant_user, file = str_c(path_output, "relevant_user.Rdata"))
+
+```
+
+# Preprocess user bios
+
+```{r preprocess user bios, include = FALSE}
+
+## Filter English speaking users (bio in English => user English-speaking)
+user_bio <- relevant_user %>%
+  select(creator, bio) %>%
+  filter(bio != "") %>%
+  mutate(bio = replace_contraction(bio, contraction.key = lexicon::key_contractions),
+         bio = str_remove_all(bio, pattern = "#"),
+         bio = str_to_lower(bio),
+         language_2 = cld2::detect_language(bio),
+         language_3 = cld3::detect_language(bio)) %>%
+  filter(language_2 == "en" | language_3 == "en") %>%
+  mutate(user_id = row_number())
+
+save(user_bio, file = str_c(path_output, "user_bio.Rdata"))
+
+# Annotate bios with udpipe model
+splits <- 1000
+# Split dataset for parallelization
+bios_split <- split(user_bio, (seq(nrow(user_bio))-1) %/% splits)
+annotation <- bios_split %>%
+  future_map(annotate_splits, var = "bio", .progress = TRUE, .options = furrr_options(seed = TRUE)) %>%
+  future_map(~ mutate(.x, doc_id = as.numeric(str_remove(doc_id, pattern = "doc"))))
+
+# Fix document numbering
+for (i in 2:length(annotation)) {
+  annotation[[i]] <- annotation[[i]] %>%
+    mutate(doc_id = doc_id+(i-1)*splits)
+}
+
+bios_annotated <- bind_rows(annotation)
+
+save(bios_annotated, file = str_c(path_output, "bios_annotated.Rdata"))
+
+# Clean annotated bios
+tidy_bios <- bios_annotated %>%
+  select(doc_id, token, upos) %>%
+  mutate(token = str_to_lower(token, locale = "en"),
+         token_lag = lag(token),
+         # Handle split of "wwg1wga"
+         token = if_else(str_detect(token, pattern = "wwg") & str_detect(lead(token), pattern = "1") & str_detect(lead(token, n = 2), pattern = "wga"), "wwg1wga", token, missing = token),
+         upos = if_else(token == "1" & lag(token) == "wwg1wga" & lead(token) == "wga", "DROP", upos, missing = token),
+         upos = if_else(token == "wga" & lag(token, n = 2) == "wwg1wga" & lag(token) == "1", "DROP", upos, missing = token),
+         token = if_else(token == "wwg1" & lead(token) == "wga", "wwg1wga", token, missing = token),
+         upos = if_else(token == "wga" & lag(token) == "wwg1wga", "DROP", upos, missing = token),
+         token = if_else(str_detect(token_lag, pattern = "^@$|^#$"), str_c(token_lag, token, sep = ""), token, missing = token),  
+         upos = if_else(str_detect(token, pattern = "@|#"), "X", upos), # label # -> X, @ -> X
+         upos = if_else(str_detect(token, pattern = "^@$|^@@$|^#$|^##$"), "DROP", upos),
+         upos = if_else(str_detect(token, pattern = "^\\d$"), "NUM", upos),
+         token = if_else(str_detect(token, pattern = "&") & upos == "CCONJ", "and", token), # "&" to "and"
+         token = str_replace_all(token, pattern = "[^\x01-\x7F]", "")) %>% # Remove Emojis
+  select(-c(token_lag)) %>%
+  left_join(user_bio, by = c("doc_id" = "user_id")) %>% # merge creator
+  rename(user_id = doc_id) %>%
+  select(-c(bio)) %>%
+  filter(!str_detect(token, pattern = "^@$|^#$") 
+         & !str_detect(token, pattern = "^'s$")
+         & upos != "PUNCT" 
+         & upos != "DROP" 
+         & upos != "SYM"
+         & upos != "NUM") %>% # Filter punctuation, single @/#, Symbols/Emojis, Numbers
+  mutate(token = str_replace_all(token, c("^n't$|^n't$|^nt$" = "not", 
+                                          "^'m$" = "am",
+                                          "^'re$" = "are",
+                                          "^'ll$" = "will",
+                                          "^'ve$" = "have",
+                                          "#|@" = "")),
+         token = str_remove_all(token, pattern = "\\.|\\?|\\!|\\:|[:blank:]")) %>%
+  filter(token != "") %>%
+  anti_join(stop, by = c("token" = "word"))
+
+save(tidy_bios, file = str_c(path_output, "tidy_bios.Rdata"))
+
+```
+
+# QAnon Identification
+
+```{r}
+
+# Classify QAnon vs. non-QAnon
+user_qanon <- user_bio %>%
+  mutate(bio = str_to_lower(bio),
+         bio = str_remove_all(bio, "@[a-z,A-Z,0-9]*"), # Remove handles
+         bio = str_remove_all(bio, "[^\x01-\x7F]"), # Remove emojis
+         bio = str_remove_all(bio, "#"), # Remove "#"
+         qIndicator = if_else(str_detect(bio, pattern = str_c(qanon_indicator, collapse = "|")), 1, 0)) %>%
+  select(creator, qIndicator)
+
+save(user_qanon, file = str_c(path_output, "user_qanon.Rdata"))
+
+user_bio_qanon <- user_qanon %>%
+  select(creator, qIndicator) %>%
+  right_join(tidy_bios, by = "creator")
+  
+save(user_bio_qanon, file =  str_c(path_output, "user_bio_qanon.Rdata"))
+
+
+```
+
+# Create user data
+
+```{r}
+
+# Match relevant user profiles with user data
+data_qanon_user <- user_data %>%
+  inner_join(user_qanon, by = c("id" = "creator")) %>%
+  select(-key) %>%
+  rename(creator = id)
+
+save(data_qanon_user, file = str_c(path_output, "data_qanon_user.Rdata"))
+
+```
+
+# Preprocess parleys
+
+```{r preprocess parleys, include = FALSE}
+
+# Tidy parleys text only no stopwords
+tidy_parleys_text <- tidy_parleys_annotated %>%
+  ungroup(comment_id, creator) %>%
+  select(comment_id, token, qIndicator) %>%
+  anti_join(stop, by = c("token" = "word"))
+
+save(tidy_parleys_text, file = str_c(path_output, "tidy_parleys_text.Rdata"))
+
+```
+
+# Feature creation
+
+```{r}
+
+# Load helper functions for text embeddings
+source("Helpers_feature_creation.R")
+
+# Set up parallel processing
+plan(multisession, workers = 13)
+
+```
+
+
+```{r embeddings, include=false}
+
+# Clean text for calculation of embeddings
+file_list_content_by_user %>%
+  future_map(~ clean_text_embedding(.x, path_input = str_c(path_input, "parleys_user/"), path_output = str_c(path_input, "parleys_user/clean_text/")))
+
+# Compute embeddings -> shifted to Python (see file Parler_text_embeddings.py)
+# list.files(path = str_c(path_input, "parleys_user/clean_text/"), pattern = "*.RDS") %>%
+#   future_map(~ compute_embeddings(.x, path_input = str_c(path_input, "parleys_user/clean_text/"), path_output = str_c(path_output, "embeddings_raw/")),
+#              furrr_options(seed = TRUE))
+  
+# Aggregate embeddings
+list.files(path = str_c(path_output, "embeddings_raw/"), pattern = "*.csv") %>%
+  future_map(~ aggregate_embeddings(.x, path_input = str_c(path_output, "embeddings_raw/"), path_output = str_c(path_output, "embeddings_aggregated/")))
+  
+# Concatenate files
+features_bert <- list.files(path = str_c(path_output, "embeddings_aggregated/"), pattern = "*.RDS") %>%
+  future_map_dfr(~ read_rds(str_c(path_output, "embeddings_aggregated/", .x)))
+
+# Save features Bert
+saveRDS(features_bert, file = str_c(path_output, "features_bert.RDS"))
+
+```
+
+# Annotation of text data
+
+```{r annotation, include=false}
+
+list.files(path = str_c(path_input, "parleys_user/"), pattern = "*.RDS") %>%
+  future_map(~ annotate_text(.x, path_input = str_c(path_input, "parleys_user/"), path_output = str_c(path_output, "annotation/")),
+             furrr_options(seed = TRUE))
+
+## For large files (3/639) 
+# Memory not sufficient => split files and annotate sequentially
+# Load files
+total <- seq(1:length(list.files(path = str_c(path_output, "annotation/"), pattern = "*RDS")))
+files <- parse_number(list.files(path = str_c(path_output, "words/"), pattern = "*.RDS"))
+missing <- total[-files]
+files_missing <- str_c("user_content_", missing, ".RDS")
+
+for (i in 1:length(files_missing)){
+  dta <- read_rds(str_c(path_input, "parleys_user/", files_missing[i])) %>%
+    select(creator, body, id) %>%
+    mutate(comment_id = row_number())
+  
+  # Annotate bios with udpipe model
+  splits <- 200000
+  # Split dataset for parallelization
+  content_split <- split(dta, (seq(nrow(dta))-1) %/% splits)
+  annotation <- content_split %>%
+    future_map(annotate_splits, var = "body", .progress = TRUE, .options = furrr_options(seed = TRUE)) %>%
+    future_map(~ mutate(.x, doc_id = as.numeric(str_remove(doc_id, pattern = "doc"))))
+  
+  # Fix document numbering
+  for (j in 1:length(annotation)) {
+    annotation[[j]] <- annotation[[j]] %>%
+      mutate(doc_id = doc_id+(j-1)*splits)
+  }
+  
+  content_annotated <- bind_rows(annotation)
+  
+  tidy_parleys_annotated <- content_annotated %>%
+    mutate(token = str_to_lower(token, locale = "en"),
+           token_lag = lag(token),
+           # Handle split of "wwg1wga"
+           token = if_else(str_detect(token, pattern = "wwg") & str_detect(lead(token), pattern = "1") & str_detect(lead(token, n = 2), pattern = "wga"), "wwg1wga", token, missing = token),
+           upos = if_else(token == "1" & lag(token) == "wwg1wga" & lead(token) == "wga", "DROP", upos, missing = token),
+           upos = if_else(token == "wga" & lag(token, n = 2) == "wwg1wga" & lag(token) == "1", "DROP", upos, missing = token),
+           token = if_else(token == "wwg1" & lead(token) == "wga", "wwg1wga", token, missing = token),
+           upos = if_else(token == "wga" & lag(token) == "wwg1wga", "DROP", upos, missing = token),
+           token = if_else(str_detect(token_lag, pattern = "^@$|^#$"), str_c(token_lag, token, sep = ""), token, missing = token), # merge single @/# with next line 
+           upos = if_else(str_detect(token, pattern = "@|#"), "X", upos), # label # -> X, @ -> X
+           upos = if_else(str_detect(token, pattern = "^@$|^@@$|^#$|^##$"), "DROP", upos),
+           token = if_else(str_detect(token, pattern = "&") & upos == "CCONJ", "and", token), # "&" to "and"
+           token = str_replace_all(token, pattern = "[^\x01-\x7F]", "")) %>% # Remove Emojis
+    select(-token_lag) %>%
+    left_join(dta, by = c("doc_id" = "comment_id")) %>% # merge creator
+    rename(comment_id = doc_id) %>%
+    select(-c(body, id)) %>%
+    filter(!str_detect(token, pattern = "^@$|^#$") 
+           & !str_detect(token, pattern = "^'s$")
+           & upos != "PUNCT" 
+           & upos != "DROP" 
+           & upos != "SYM"
+           & upos != "NUM") %>% # Filter punctuation, single @/#, Symbols/Emojis, Numbers
+    group_by(comment_id, creator) %>%
+    mutate(token = str_replace_all(token, c("^n't$|^n't$|^nt$" = "not", 
+                                            "^'m$" = "am",
+                                            "^'re$" = "are",
+                                            "^'ll$" = "will",
+                                            "^'ve$" = "have")),
+           token = str_remove_all(token, pattern = "\\.|\\!|\\?")) %>%
+    filter(token != "")
+  
+  saveRDS(tidy_parleys_annotated, file = str_c(path_output, "annotation/", "annotated_content_", parse_number(files_missing[i]), ".RDS"))
+}
+
+
+```
+
+# Linguistic features
+
+```{r, linguistic, include=false}
+
+# Features from parleys (i.e. freq of handles, hashtags, pos-tags, long words)
+list.files(path = str_c(path_input, "parleys_user/"), pattern = "*.RDS") %>%
+  future_map2(.y = list.files(path = str_c(path_output, "annotation/"), pattern = "*.RDS"),
+                  ~ create_linguistic_meta_content(.y, .x, path_input = path_input, path_output = str_c(path_output, "linguistic/")))
+
+features_linguistic <- list.files(path = str_c(path_output, "linguistic"), pattern = "*.RDS") %>%
+  future_map_dfr(~ read_rds(str_c(path_output, "linguistic/", .x)))
+
+features_linguistic <- features_linguistic %>%
+  mutate(across(.cols = c(-creator), as.numeric))#,
+         #across(.cols = c(-creator), scale),
+         #across(.cols = c(-creator, -set), ~ if_else(is.na(.x), 0, .x)))
+
+features_linguistic <- features_linguistic %>%
+  left_join(user_qanon, by = "creator")
+
+save(features_linguistic, file = str_c(path_output, "features_linguistic.Rdata"))
+
+```
+
+# User features
+
+```{r user features, include=false}
+
+# Create features from user metadata
+## Features include: # followers, # following, # comments, # posts, account age
+features_user <- data_qanon_user %>%
+  rename(user_comments = comments, user_posts = posts) %>%
+  mutate(joined = ymd_hms(joined),
+         account_age = ymd_hms("20210201000000") - joined) %>% # Compute account as of 1st February 2021
+  mutate(across(.cols = c(-creator, -qIndicator, -bio, -datatype), .fns = as.numeric))#,
+         #across(.cols = c(-creator, -qIndicator), .fns = scale),
+         #across(.cols = c(-creator, -qIndicator, -bio, -datatype), ~ if_else(is.na(.x), 0, .x)))
+
+save(features_user, file = str_c(path_output, "features_user.Rdata"))
+  
+```
+
+# Feature sets
+
+```{r features sets, include=FALSE}
+
+# Combine all features
+features_all_unalterd <- features_bert %>%
+  left_join(features_user, by = "creator") %>%
+  select(-qIndicator) %>%
+  inner_join(features_linguistic, by = "creator")
+
+save(features_all_unalterd, file = str_c(path_output, "features_all_unscaled.Rdata"))
+  
+# Scale features
+features_all <- features_all_unalterd %>%
+  mutate(across(.cols = c(-creator, -qIndicator, -names_features_text, -bio, -datatype, -set), ~ if_else(is.na(.x), 0, .x)),
+         across(.cols = c(-creator, -qIndicator, -names_features_text, -bio, -datatype, -set), ~ scale(.x)),
+         across(.cols = c(-creator, -qIndicator, -names_features_text, -bio, -datatype, -set), ~ as.vector(.x))) %>%
+  select(creator, qIndicator, all_of(names_features_all))
+
+save(features_all, file = str_c(path_output, "features_all.Rdata"))
+
+```
