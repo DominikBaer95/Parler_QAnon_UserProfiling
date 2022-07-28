@@ -1,6 +1,6 @@
 # Finding Qs: Profiling QAnon Supporters on Parler
 
-This repository contains the code for the implementation of “Finding Qs: Profiling QAnon Supporters on Parler.”
+This repository contains the code for the implementation of “Finding Qs: Profiling QAnon Supporters on Parler” accepted at the International AAAI Conference on Web and Social Media (ICWSM, 2023). 
 
 ## Abstract
 
